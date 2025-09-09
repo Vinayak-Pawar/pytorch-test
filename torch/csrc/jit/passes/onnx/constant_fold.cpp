@@ -438,16 +438,36 @@ std::optional<at::Tensor> runTorchBackendForOnnx(
     updated_val = at::_shape_as_tensor(inputTensorValues[0]);
     return std::optional<at::Tensor>(updated_val);
   } else if (node->kind() == onnx::ReduceL1 || node->kind() == onnx::ReduceL2) {
-    assert(inputTensorValues.size() == 1);
-    if (!node->hasAttributeS("axes")) {
-      return std::nullopt;
-    }
+    TORCH_INTERNAL_ASSERT(
+        inputTensorValues.size() >= 1 && inputTensorValues.size() <= 2,
+        "Constant folding - Invalid number of inputs found for onnx::ReduceL1/L2 op.");
     if (!node->hasAttributeS("keepdims")) {
       return std::nullopt;
     }
+
+    std::vector<int64_t> axes;
+    if (inputTensorValues.size() == 2) {
+      // Opset 18 introduces axes as a dynamic input.
+      auto axes_tensor = inputTensorValues[1];
+      if (axes_tensor.numel() > 0) {
+        auto axes_a = axes_tensor.accessor<int64_t, 1>();
+        for (const auto i : c10::irange(axes_tensor.numel())) {
+          axes.push_back(axes_a[i]);
+        }
+      }
+    } else {
+      // Fallback to attribute for older opsets.
+      if (node->hasAttributeS("axes")) {
+        axes = node->is(attr::axes);
+      }
+    }
+
     int p = node->kind() == onnx::ReduceL1 ? 1 : 2;
     updated_val = at::norm(
-        inputTensorValues[0], p, node->is(attr::axes), node->i(attr::keepdims));
+        inputTensorValues[0],
+        p,
+        c10::IntArrayRef(axes),
+        node->i(attr::keepdims));
     return std::optional<at::Tensor>(updated_val);
   } else if (node->kind() == onnx::ReduceProd) {
     int64_t rank = inputTensorValues[0].sizes().size();
