@@ -155,7 +155,6 @@ class _PipelineStageBase(ABC):
         self.submod = submodule
         self.stage_index = stage_index
         self.num_stages = num_stages
-        # pyrefly: ignore [read-only]
         self.device = device
         self.group = group
 
@@ -502,7 +501,7 @@ class _PipelineStageBase(ABC):
                 )
                 ops.append(dist.P2POp(dist.isend, grad, peer_global_rank, self.group))
             else:
-                if not (grad is None and grad_recv_stage is None):
+                if grad is not None or grad_recv_stage is not None:
                     raise RuntimeError(
                         f"[{self.stage_index}] for chunk {bwd_chunk_id} has gradients {grad} "
                         f"and is expecting to send gradients to stage {grad_recv_stage}"
@@ -1007,8 +1006,8 @@ class _PipelineStageBase(ABC):
                 distributed_state = fully_shard.state(fsdp_module)  # type: ignore[attr-defined]
 
             for state in distributed_state._state_ctx.all_states:
-                if state._fsdp_param_group:
-                    state._fsdp_param_group.post_backward()
+                for fsdp_param_group in state._fsdp_param_groups:
+                    fsdp_param_group.post_backward()
 
             # it would be much better if pipelining backward invoked .backward so autograd hooks
             # worked and modules like DDP/FSDP behaved as expected.  Working around this for the time being,

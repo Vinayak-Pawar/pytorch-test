@@ -1103,7 +1103,9 @@ Tensor sparse_sparse_matmul_mps(const Tensor& mat1_, const Tensor& mat2_) {
   auto v_out = vA_out.mul(vB_out);
 
   // build (2, P) indices
-  auto out_indices = at::empty({2, P}, at::device(device).dtype(at::kLong)).contiguous();
+  auto out_indices = at::empty(
+      {2, P},
+      at::device(device).dtype(at::kLong).memory_format(c10::MemoryFormat::Contiguous));
   out_indices.select(0, 0).copy_(i_out);
   out_indices.select(0, 1).copy_(j_out);
 
@@ -1409,7 +1411,7 @@ static Tensor softmax_sparse_mps_impl(
         auto pso = lib.getPipelineStateForFunc("mark_segments");
         auto enc = stream->commandEncoder();
         [enc setComputePipelineState:pso];
-        mtl_setArgs(enc, sorted_pool_indices, mask, nnz_u);
+        mtl_setArgs(enc, sorted_pool_indices, mask);
 
         auto gridSize = MTLSizeMake(nnz, 1, 1);
         auto threadGroupSize = MTLSizeMake(std::min<uint64_t>(nnz, pso.maxTotalThreadsPerThreadgroup), 1, 1);
@@ -1522,7 +1524,7 @@ static Tensor softmax_backward_sparse_mps_impl(
         auto pso = lib.getPipelineStateForFunc("mark_segments");
         auto enc = stream->commandEncoder();
         [enc setComputePipelineState:pso];
-        mtl_setArgs(enc, sorted_pool_indices, mask, nnz_u);
+        mtl_setArgs(enc, sorted_pool_indices, mask);
         auto gridSize = MTLSizeMake(nnz, 1, 1);
         auto threadGroupSize = MTLSizeMake(std::min<uint64_t>(nnz, pso.maxTotalThreadsPerThreadgroup), 1, 1);
         [enc dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
