@@ -364,6 +364,10 @@ print(t.is_pinned())
                 torch.cuda.caching_allocator_delete(mem)
                 self.assertEqual(torch.cuda.memory_allocated(), prev)
 
+    def test_caching_allocator_alloc_negative_size(self):
+        with self.assertRaisesRegex(ValueError, "Invalid memory size"):
+            torch.cuda.memory.caching_allocator_alloc(-1024)
+
     def test_memory_stats(self):
         gc.collect()
         torch.cuda.empty_cache()
@@ -4899,7 +4903,6 @@ class TestCudaAllocator(TestCase):
         torch.cuda.empty_cache()
         device = torch._C._cuda_getDevice()
         torch._C._cuda_resetAccumulatedMemoryStats(device)
-        orig_fraction = torch.cuda.get_per_process_memory_fraction(0)
 
         try:
             # Test 1: With rejection disabled (default), allocations should succeed
@@ -4911,8 +4914,11 @@ class TestCudaAllocator(TestCase):
             # Test 2: With throw_on_cudamalloc_oom enabled and a tight memory
             # fraction, allocations that exceed the fraction limit should be
             # preemptively rejected with OutOfMemoryError.
-            torch._C._accelerator_setAllocatorSettings("throw_on_cudamalloc_oom:True")
-            torch.cuda.set_per_process_memory_fraction(0.01, 0)
+            # Both settings must go through _accelerator_setAllocatorSettings so
+            # they are read from CUDAAllocatorConfig.
+            torch._C._accelerator_setAllocatorSettings(
+                "throw_on_cudamalloc_oom:True,per_process_memory_fraction:0.01"
+            )
 
             with self.assertRaises(torch.cuda.OutOfMemoryError):
                 torch.empty(1024 * 1024 * 1024, dtype=torch.int8, device="cuda")
@@ -4923,8 +4929,9 @@ class TestCudaAllocator(TestCase):
 
         finally:
             torch.cuda.empty_cache()
-            torch.cuda.set_per_process_memory_fraction(orig_fraction, 0)
-            torch._C._accelerator_setAllocatorSettings("throw_on_cudamalloc_oom:False")
+            torch._C._accelerator_setAllocatorSettings(
+                "throw_on_cudamalloc_oom:False,per_process_memory_fraction:1.0"
+            )
 
     def test_allocator_backend(self):
         def check_output(script: str) -> str:
