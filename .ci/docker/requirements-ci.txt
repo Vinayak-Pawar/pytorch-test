@@ -335,7 +335,7 @@ pywavelets==1.7.0 ; python_version >= "3.12"
 #test that import:
 
 lxml==5.3.0 ; python_version < "3.14"
-lxml==6.0.2 ; python_version >= "3.14"
+lxml==6.1.0 ; python_version >= "3.14"
 #Description: This is a requirement of unittest-xml-reporting
 
 PyGithub==2.3.0
@@ -375,7 +375,7 @@ pwlf==2.2.1
 #test that import: test_sac_estimator.py
 
 # To build PyTorch itself
-pip==26.0.1
+pip==26.1
 pyyaml==6.0.3
 pyzstd
 setuptools==78.1.1
