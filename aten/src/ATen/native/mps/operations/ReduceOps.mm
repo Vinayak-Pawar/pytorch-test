@@ -59,7 +59,6 @@ enum MPSReductionType {
   SUM,
   PROD,
   MEAN,
-  COUNT_NONZERO,
   TRACE,
   NANSUM,
 };
@@ -205,11 +204,6 @@ static void reduction_out_mps(const Tensor& input_t,
       case MPSReductionType::MEAN:
         output_t.fill_(std::numeric_limits<float>::quiet_NaN());
         break;
-      case MPSReductionType::SUM:
-      case MPSReductionType::NANSUM:
-      case MPSReductionType::COUNT_NONZERO:
-        output_t.zero_();
-        break;
       case MPSReductionType::AMAX:
       case MPSReductionType::AMIN:
       case MPSReductionType::MAX:
@@ -256,12 +250,6 @@ static void reduction_out_mps(const Tensor& input_t,
         castOutputTensor = [mpsGraph reductionProductWithTensor:castInputTensor axes:wrappedAxes name:nil];
       } else if (reduction_type == MPSReductionType::MEAN) {
         castOutputTensor = [mpsGraph meanOfTensor:castInputTensor axes:wrappedAxes name:nil];
-      } else if (reduction_type == MPSReductionType::COUNT_NONZERO) {
-        MPSGraphTensor* zeros = [mpsGraph constantWithScalar:0 dataType:castInputTensor.dataType];
-
-        MPSGraphTensor* nonZeros = [mpsGraph notEqualWithPrimaryTensor:castInputTensor secondaryTensor:zeros name:nil];
-
-        castOutputTensor = [mpsGraph reductionSumWithTensor:nonZeros axes:wrappedAxes name:nil];
       } else if (reduction_type == MPSReductionType::AMAX) {
         castOutputTensor = [mpsGraph reductionMaximumPropagateNaNWithTensor:castInputTensor axes:wrappedAxes name:nil];
       } else if (reduction_type == MPSReductionType::AMIN) {
@@ -891,7 +879,208 @@ static void argmax_argmin_out_mps(const Tensor& input_t,
   }
 }
 
-} // namespace mps
+// Shared implementation for sum/nansum/count_nonzero/mean Metal kernels.
+// `kernel_prefix` is "sum_", "nansum_" or "count_nonzero_" — selects the
+// kernel variant to dispatch.  `divisor` > 0 divides the accumulator (in
+// opmath_t) before casting to output, enabling fused mean without losing the
+// fp32 accumulation precision for fp16/bf16/half2 outputs.
+static void sum_nansum_kernel_mps(TensorIterator& iter, const std::string& kernel_prefix, float divisor = 0.0f) {
+  const Tensor& output = iter.output(0);
+  const Tensor& input = iter.input(0);
+
+  if (input.numel() == 0) {
+    output.zero_();
+    return;
+  }
+
+  if (output.numel() == 0) {
+    return;
+  }
+
+  uint32_t reduction_size = input.numel() / output.numel();
+
+  // TensorIterator ensures input and output have matching ndim
+  // (reduced dims have size 1 in output)
+  TORCH_INTERNAL_ASSERT(output.dim() == input.dim());
+
+  constexpr uint32_t NCHAINS = SUM_NCHAINS;
+
+  auto kernel_name =
+      fmt::format("{}reduction_{}_{}", kernel_prefix, scalarToMetalTypeString(input), scalarToMetalTypeString(output));
+
+  MPSStream* stream = getCurrentMPSStream();
+
+  // For large full reductions (output is scalar), use multi-TG with a
+  // two-pass approach: first pass splits work across num_groups TGs writing
+  // partial sums, second pass reduces the partials to the final scalar.
+  if (output.numel() == 1 && reduction_size > MAX_THREADGROUP_SIZE * NCHAINS) {
+    auto num_groups = std::min(512u, c10::metal::ceil_div(reduction_size, MAX_THREADGROUP_SIZE * NCHAINS));
+
+    // elems_per_group * num_groups must equal reduction_size exactly,
+    // otherwise pass 1's last TG reads past the input's logical end.
+    // Reduce num_groups down to a divisor of reduction_size (falling back
+    // to 1 is always safe — the inner loop still parallelizes via threads).
+    while (num_groups > 1 && reduction_size % num_groups != 0) {
+      num_groups--;
+    }
+
+    auto partials = at::empty({num_groups}, output.options());
+    const auto elems_per_group = reduction_size / num_groups;
+
+    auto out_metal = scalarToMetalTypeString(output);
+    auto p1_kernel = fmt::format("{}reduction_{}_{}", kernel_prefix, scalarToMetalTypeString(input), out_metal);
+    // Pass 2 combines partials by summing them regardless of pass-1 mode.
+    // For count_nonzero the partials are already per-block counts (long);
+    // counting them again would be wrong, so always use "sum_" here.
+    auto p2_kernel = fmt::format("sum_reduction_{}_{}", out_metal, out_metal);
+
+    // Model as 2D: input is [num_groups, elems_per_group], reduce dim=1
+    // Dim 0 (non-reduced): size=num_groups, input_stride=elems_per_group, output_stride=1
+    // Dim 1 (reduced):     size=elems_per_group, input_stride=1
+    NormParams params1;
+    params1.ndim = 2;
+    params1.p = 0;
+    params1.reduction_size = elems_per_group;
+    params1.input_sizes[0] = num_groups;
+    params1.input_strides[0] = elems_per_group;
+    params1.output_sizes[0] = num_groups;
+    params1.output_strides[0] = 1;
+    params1.input_sizes[1] = elems_per_group;
+    params1.input_strides[1] = 1;
+    params1.output_sizes[1] = 1;
+    params1.output_strides[1] = 0;
+
+    // Pass 2: partials[num_groups] -> output[1], reduce dim=0.
+    // divisor applies here (not on pass 1), so pass 2 produces
+    // accumulator/divisor before the final cast to output dtype.
+    NormParams params2;
+    params2.ndim = 1;
+    params2.p = divisor;
+    params2.reduction_size = num_groups;
+    params2.input_sizes[0] = num_groups;
+    params2.input_strides[0] = 1;
+    params2.output_sizes[0] = 1;
+    params2.output_strides[0] = 0;
+
+    dispatch_sync_with_rethrow(stream->queue(), ^() {
+      @autoreleasepool {
+        id<MTLComputeCommandEncoder> compute_encoder = stream->commandEncoder();
+
+        // Pass 1: input -> partials
+        auto ps1 = lib.getPipelineStateForFunc(p1_kernel);
+        getMPSProfiler().beginProfileKernel(ps1, "sum_reduction_pass1", {input});
+        [compute_encoder setComputePipelineState:ps1];
+        mtl_setArgs(compute_encoder, input, partials, params1);
+        auto tpg1 = std::min(MAX_THREADGROUP_SIZE, elems_per_group);
+        [compute_encoder dispatchThreads:MTLSizeMake(num_groups * tpg1, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(tpg1, 1, 1)];
+        getMPSProfiler().endProfileKernel(ps1);
+
+        // Pass 2: partials -> output
+        auto ps2 = lib.getPipelineStateForFunc(p2_kernel);
+        getMPSProfiler().beginProfileKernel(ps2, "sum_reduction_pass2", {partials});
+        [compute_encoder setComputePipelineState:ps2];
+        mtl_setArgs(compute_encoder, partials, output, params2);
+        auto tpg2 = std::min(MAX_THREADGROUP_SIZE, num_groups);
+        [compute_encoder dispatchThreads:MTLSizeMake(tpg2, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg2, 1, 1)];
+        getMPSProfiler().endProfileKernel(ps2);
+      }
+    });
+    return;
+  }
+
+  // Detect outer-dim (non-innermost) reduction on contiguous 2D tensor.
+  // For this case, use a specialized kernel with coalesced column reads.
+  // Condition: exactly one reduced dim, it's not the last dim, input is contiguous.
+  {
+    int num_reduced = 0;
+    int reduced_dim = -1;
+    for (int64_t d = 0; d < input.dim(); d++) {
+      if (input.size(d) != output.size(d)) {
+        num_reduced++;
+        reduced_dim = d;
+      }
+    }
+    bool is_outer_reduction = (num_reduced == 1 && reduced_dim < input.dim() - 1 && input.is_contiguous());
+    bool is_inner_reduction = (num_reduced == 1 && reduced_dim == input.dim() - 1 && input.is_contiguous());
+
+    if (is_outer_reduction && reduced_dim == 0 && output.is_contiguous()) {
+      uint32_t M = input.size(0);
+      uint32_t N = input.numel() / M;
+
+      auto outer_kernel = fmt::format(
+          "{}reduction_outer_{}_{}", kernel_prefix, scalarToMetalTypeString(input), scalarToMetalTypeString(output));
+      constexpr uint32_t TG_X = 32, TG_Y = 32;
+      const auto num_tg_x = c10::metal::ceil_div(N, TG_X);
+
+      dispatch_sync_with_rethrow(stream->queue(), ^() {
+        @autoreleasepool {
+          id<MTLComputeCommandEncoder> compute_encoder = stream->commandEncoder();
+          auto ps = lib.getPipelineStateForFunc(outer_kernel);
+          getMPSProfiler().beginProfileKernel(ps, "sum_reduction_outer", {input});
+          struct {
+            uint32_t M, N, out_stride;
+          } sizes_s = {M, N, 1};
+          [compute_encoder setComputePipelineState:ps];
+          mtl_setArgs(compute_encoder, input, output, sizes_s, divisor);
+          [compute_encoder dispatchThreads:MTLSizeMake(num_tg_x * TG_X, TG_Y, 1)
+                     threadsPerThreadgroup:MTLSizeMake(TG_X, TG_Y, 1)];
+          getMPSProfiler().endProfileKernel(ps);
+        }
+      });
+      return;
+    }
+
+    if (is_inner_reduction && output.is_contiguous()) {
+      // M = product of all non-reduced dims, N = size of last dim
+      uint32_t N = input.size(input.dim() - 1);
+      uint32_t M = input.numel() / N;
+
+      auto inner_kernel = fmt::format(
+          "{}reduction_inner_{}_{}", kernel_prefix, scalarToMetalTypeString(input), scalarToMetalTypeString(output));
+      // Pack multiple rows per TG: each SIMD group (32 threads) handles one row
+      constexpr uint32_t TG_SIZE = 256; // 8 SIMD groups = 8 rows per TG
+      constexpr uint32_t rows_per_tg = TG_SIZE / 32;
+      const auto num_tgs = c10::metal::ceil_div(M, rows_per_tg);
+
+      dispatch_sync_with_rethrow(stream->queue(), ^() {
+        @autoreleasepool {
+          id<MTLComputeCommandEncoder> compute_encoder = stream->commandEncoder();
+          auto ps = lib.getPipelineStateForFunc(inner_kernel);
+          getMPSProfiler().beginProfileKernel(ps, "sum_reduction_inner", {input});
+          struct {
+            uint32_t M, N;
+          } sizes_s = {M, N};
+          [compute_encoder setComputePipelineState:ps];
+          mtl_setArgs(compute_encoder, input, output, sizes_s, divisor);
+          [compute_encoder dispatchThreads:MTLSizeMake(num_tgs * TG_SIZE, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
+          getMPSProfiler().endProfileKernel(ps);
+        }
+      });
+      return;
+    }
+  }
+
+  NormParams params;
+  params.ndim = input.dim();
+  params.p = divisor;
+  params.reduction_size = reduction_size;
+
+  for (const auto dim_idx : c10::irange(input.dim())) {
+    params.input_sizes[dim_idx] = input.size(dim_idx);
+    params.input_strides[dim_idx] = input.stride(dim_idx);
+    params.output_sizes[dim_idx] = output.size(dim_idx);
+    params.output_strides[dim_idx] = output.stride(dim_idx);
+  }
+
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> compute_encoder = stream->commandEncoder();
+      auto pipeline_state = lib.getPipelineStateForFunc(kernel_name);
+      getMPSProfiler().beginProfileKernel(pipeline_state, "sum_reduction", {input});
+      [compute_encoder setComputePipelineState:pipeline_state];
+      mtl_setArgs(compute_encoder, input, output, params);
 
 using namespace mps;
 
@@ -924,6 +1113,10 @@ Tensor nansum_mps(const Tensor& self, OptionalIntArrayRef dim, bool keepdim, std
   ScalarType dtype = get_dtype_from_self(self, opt_dtype, true);
   Tensor result = create_reduction_result(self, dim, keepdim, dtype);
   return nansum_out_mps(self, dim, keepdim, dtype, result);
+}
+
+static void count_nonzero_kernel_mps(TensorIterator& iter) {
+  sum_nansum_kernel_mps(iter, "count_nonzero_");
 }
 
 Tensor trace_mps(const Tensor& self) {
@@ -995,32 +1188,11 @@ Tensor prod_mps(const Tensor& self, std::optional<ScalarType> opt_dtype) {
 }
 
 Tensor count_nonzero_mps(const Tensor& self, IntArrayRef dims) {
-  int64_t shape_size = dims.size() == 0 ? 0 : self.sizes().size() - dims.size();
-  int64_t out_shape = std::max(shape_size, 0LL);
-  std::vector<int64_t> output_shape(out_shape);
-  std::vector<int64_t> dims_vec = dims.vec();
-  std::for_each(dims_vec.begin(), dims_vec.end(), [&](int64_t& n) { n = maybe_wrap_dim(n, self); });
-
-  if (out_shape != 0) {
-    int out_dim = 0;
-    for (const auto self_dim : c10::irange((self.sizes().size()))) {
-      if (std::find(dims_vec.begin(), dims_vec.end(), self_dim) == dims_vec.end()) {
-        output_shape[out_dim++] = (self.sizes()[self_dim]);
-      }
-    }
-  }
-
-  Tensor output_t =
-      at::empty(IntArrayRef(output_shape), ScalarType::Long, std::nullopt, kMPS, std::nullopt, std::nullopt);
-  reduction_out_mps(self,
-                    dims,
-                    false,
-                    self.scalar_type(),
-                    const_cast<Tensor&>(output_t),
-                    MPSReductionType::COUNT_NONZERO,
-                    "count_nonzero_mps");
-
-  return output_t;
+  Tensor result = create_reduction_result(self, dims, /*keepdim=*/false, ScalarType::Long);
+  auto iter =
+      make_reduction("count_nonzero_mps", result, self, dims, /*keepdim=*/false, self.scalar_type(), ScalarType::Long);
+  count_nonzero_kernel_mps(iter);
+  return result;
 }
 
 TORCH_IMPL_FUNC(mean_out_mps)

@@ -1328,7 +1328,7 @@ class Graph:
         self._find_nodes_lookup_table = _FindNodesLookupTable()
 
     @property
-    def owning_module(self):
+    def owning_module(self) -> GraphModule | None:
         return self._owning_module
 
     @owning_module.setter
