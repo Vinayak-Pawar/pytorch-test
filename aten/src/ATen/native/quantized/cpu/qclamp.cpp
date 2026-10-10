@@ -67,7 +67,8 @@ Tensor qnnpack_clamp(Tensor input, const Scalar& min, const Scalar& max) {
     input_contig.sizes(),
     input_contig.options(),
     input_contig.q_scale(),
-    input_contig.q_zero_point());
+    input_contig.q_zero_point(),
+    input_contig.suggest_memory_format());
 
   const pytorch_qnnp_status setupStatus = pytorch_qnnp_setup_clamp_nc_u8(
     clamp_op,
